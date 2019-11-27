@@ -177,7 +177,6 @@ object Serve {
     {
       case req: HttpRequest if rpcMethodSerializers.contains(req.uri.path) =>
         val startTime = System.nanoTime()
-        val responseCodec = Codecs.negotiate(req)
         val handler = rpcMethodSerializers(req.uri.path)
 
         // Only report request stats for unary commands, doesn't make sense for streamed
@@ -185,10 +184,21 @@ object Serve {
           statsCollector ! StatsCollector.RequestReceived
         }
 
-        unmarshalStream(req)(handler.serializer, mat) // FIXME Figure out if we need to deal with unmarshal vs unmarshal stream here
-          .map({ commands =>
-            marshalStream(
-              commands.via({
+        import akka.grpc.internal.{CancellationBarrierGraphStage, GrpcResponseHelpers}
+        import akka.grpc.scaladsl.headers.`Message-Encoding`
+        import akka.grpc.Grpc
+        import akka.stream.scaladsl.Keep
+
+        val responseCodec = Codecs.negotiate(req)
+        val messageEncoding = `Message-Encoding`.findIn(req.headers)
+
+        Future.successful(
+          GrpcResponseHelpers(
+            req.entity.dataBytes
+              .viaMat(Grpc.grpcFramingDecoder(messageEncoding))(Keep.none)
+              .map(handler.serializer.deserialize)
+              .via(new CancellationBarrierGraphStage) // In gRPC we signal failure by returning an error code, so we don't want the cancellation bubbled out
+              .via({
                 val pipeline = handler.flowUsing(entityDiscoveryClient, log) // TODO consider caching this
                 if (handler.unary) {
                   pipeline.watchTermination() { (_, complete) =>
@@ -201,10 +211,9 @@ object Serve {
                   pipeline
                 }
               }),
-              mapRequestFailureExceptions
-            )(ReplySerializer, mat, responseCodec, sys)
-          })
-          .recoverWith(GrpcExceptionHandler.default(GrpcExceptionHandler.defaultMapper(sys)))
+            mapRequestFailureExceptions
+          )(ReplySerializer, mat, responseCodec, sys)
+        )
     }
   }
 
